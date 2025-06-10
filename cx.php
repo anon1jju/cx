@@ -1,152 +1,121 @@
 <?php
-require_once "randomuser.php";
+// validate_email_api.php
 
-// --- Load Configuration ---
-$jsonData = file_get_contents('key.json');
-if ($jsonData === false) {
-    die(json_encode(['status' => 'error', 'response' => 'Error reading']));
+// Include file konfigurasi dan fungsi database
+require_once 'config.php'; // Jika Anda memisahkannya
+require_once 'fungsi.php';
+require_once 'randomuser.php';
+
+
+// --- Dapatkan Koneksi Database ---
+$pdo = connectDB();
+
+if (!$pdo) {
+    header('Content-Type: application/json');
+    http_response_code(503); // Service Unavailable
+    echo json_encode(['status' => 'error', 'message' => 'Tidak dapat terhubung ke layanan data. Silakan coba lagi nanti.']);
+    exit;
 }
 
-$config = json_decode($jsonData, true);
-if (json_last_error() !== JSON_ERROR_NONE || !isset($config['apis']) || !is_array($config['apis'])) {
-    die(json_encode(['status' => 'error', 'response' => 'Invalid configuration']));
+// --- Dapatkan API Key untuk PostcodeAnywhere ---
+$postcode_anywhere_credentials = getPostcodeAnywhereApiKey();
+if (!$postcode_anywhere_credentials || !isset($postcode_anywhere_credentials['api']) || !isset($postcode_anywhere_credentials['site'])) {
+    header('Content-Type: application/json');
+    http_response_code(500); // Internal Server Error
+    echo json_encode(['status' => 'error', 'message' => 'Gagal memuat konfigurasi API Key eksternal.']);
+    exit;
+}
+$selected_postcode_api_key = $postcode_anywhere_credentials['api'];
+$selected_site_referer = $postcode_anywhere_credentials['site'];
+// Anda juga bisa mengambil $randuser dari sini jika ada di JSON, atau tetap statis
+
+// --- 1. Receive Request ---
+$user_provided_key = $_GET['user_api_key'] ?? null;
+$email_to_validate = $_GET['email'] ?? null;
+
+if (!$user_provided_key || !$email_to_validate) {
+    header('Content-Type: application/json');
+    http_response_code(400); // Bad Request
+    echo json_encode(['status' => 'error', 'message' => 'API key atau email tidak ditemukan']);
+    exit;
 }
 
-// --- Load Users ---
-$userFile = 'user.json';
-$userData = file_get_contents($userFile);
+try {
+    // --- 2. Authenticate User (Sistem Anda) ---
+    $stmt = $pdo->prepare("SELECT id, is_active FROM users WHERE system_api_key = :api_key");
+    $stmt->bindParam(':api_key', $user_provided_key);
+    $stmt->execute();
+    $user = $stmt->fetch();
 
-if ($userData === false || empty($userData)) {
-    die(json_encode(['status' => 'error', 'response' => 'Error reading user.json or file is empty']));
-}
+    if (!$user || !$user['is_active']) {
+        header('Content-Type: application/json');
+        http_response_code(401); // Unauthorized
+        echo json_encode(['status' => 'error', 'message' => 'API Key sistem tidak valid atau tidak aktif']);
+        exit;
+    }
+    $user_id = $user['id'];
 
-$users = json_decode($userData, true);
-if (json_last_error() !== JSON_ERROR_NONE || !isset($users['user']) || !is_array($users['user'])) {
-    die(json_encode(['status' => 'error', 'response' => 'Invalid or corrupted format']));
-}
+    // --- 3. Check Rate Limit (Sistem Anda) ---
+    $stmt = $pdo->prepare("SELECT COUNT(*) as daily_count FROM api_usage_logs WHERE user_id = :user_id AND DATE(request_timestamp) = CURDATE()");
+    $stmt->bindParam(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt->execute();
+    $usage = $stmt->fetch();
 
-// --- Get Parameters ---
-header('Content-Type: application/json');
-
-if (!isset($_GET['user']) || empty($_GET['user'])) {
-    echo json_encode(['status' => 'error', 'response' => 'User parameter is required']);
-    exit();
-}
-$user = htmlspecialchars($_GET['user']); // Sanitasi input
-
-if (!isset($_GET['email']) || empty($_GET['email'])) {
-    echo json_encode(['status' => 'error', 'response' => 'Email parameter is required']);
-    exit();
-}
-$email = filter_var($_GET['email'], FILTER_SANITIZE_EMAIL); // Validasi email
-
-if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-    echo json_encode(['status' => 'error', 'response' => 'Invalid email format']);
-    exit();
-}
-
-// --- Current Date ---
-$currentDate = date('Y-m-d');
-
-// --- Validate User ---
-$userValid = false;
-
-// Implement flock() for safe file writing
-function saveUserData($filePath, $data) {
-    $backupFile = $filePath . '.bak';
-    copy($filePath, $backupFile); // Create backup before writing
-    
-    $fp = fopen($filePath, 'c+');
-    if ($fp === false) {
-        return false;
+    if ($usage && $usage['daily_count'] >= 15000) {
+        header('Content-Type: application/json');
+        http_response_code(429); // Too Many Requests
+        echo json_encode(['status' => 'error', 'message' => 'Batas permintaan harian sistem telah tercapai']);
+        exit;
     }
 
-    if (flock($fp, LOCK_EX)) { // Lock file
-        ftruncate($fp, 0); // Clear file
-        fwrite($fp, json_encode($data, JSON_PRETTY_PRINT));
-        fflush($fp);
-        flock($fp, LOCK_UN); // Unlock file
-        fclose($fp);
-        return true;
-    } else {
-        fclose($fp);
-        return false;
-    }
+    // --- 4. Log the Request (Sistem Anda) ---
+    $stmt = $pdo->prepare("INSERT INTO api_usage_logs (user_id) VALUES (:user_id)");
+    $stmt->bindParam(':user_id', $user_id, PDO::PARAM_INT);
+    $stmt->execute();
+
+} catch (PDOException $e) {
+    error_log("Database Error: " . $e->getMessage());
+    header('Content-Type: application/json');
+    http_response_code(500); // Internal Server Error
+    echo json_encode(['status' => 'error', 'message' => 'Terjadi kesalahan pada server.']);
+    exit;
 }
 
-foreach ($users['user'] as &$userEntry) {
-    if ($userEntry['username'] === $user) {
-        $userValid = true;
-
-        // Reset usage if a new day
-        if (!isset($userEntry['last_reset']) || $userEntry['last_reset'] !== $currentDate) {
-            $userEntry['usage'] = 0;
-            $userEntry['last_reset'] = $currentDate;
-        }
-
-        // Check usage limit
-        if ($userEntry['usage'] >= $userEntry['limit']) {
-            echo json_encode(['status' => 'error', 'response' => 'Daily limit exceeded']);
-            exit();
-        }
-
-        // Increment usage
-        $userEntry['usage'] += 1;
-
-        // Save updated data back to user.json
-        $success = saveUserData($userFile, $users);
-        if (!$success) {
-            echo json_encode(['status' => 'error', 'response' => 'Failed to update user data']);
-            exit();
-        }
-        break;
-    }
-}
-
-if (!$userValid) {
-    echo json_encode(['status' => 'error', 'response' => 'Your API key is not valid']);
-    exit();
-}
-
-// --- Select Random API Key ---
-$apis = $config['apis'];
-$randomIndex = array_rand($apis);
-$selectedApi = $apis[$randomIndex];
-
-$apiKey = $selectedApi['api'];
-$site = $selectedApi['site'];
-
-// --- Call Email Validation API ---
+// --- 5. Perform Email Validation (Menggunakan key terpilih dari JSON) ---
 $ch = curl_init();
-$url = "https://services.postcodeanywhere.co.uk/EmailValidation/Interactive/Validate/v2.00/json3ex.ws?Key=" . urlencode($apiKey) . "&Email=" . urlencode($email);
+$url = "https://services.postcodeanywhere.co.uk/EmailValidation/Interactive/Validate/v2.00/json3ex.ws?Key=" . urlencode($selected_postcode_api_key) . "&Email=" . urlencode($email_to_validate);
 
 curl_setopt($ch, CURLOPT_URL, $url);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-curl_setopt($ch, CURLOPT_PROXY, "http://brd.superproxy.io:33335");
-curl_setopt($ch, CURLOPT_PROXYUSERPWD, "brd-customer-hl_11e62775-zone-datacenter_proxy1:wcnjalokvk2z");
+curl_setopt($ch, CURLOPT_PROXY, "http://brd.superproxy.io:33335"); // Pastikan proxy ini masih relevan
+curl_setopt($ch, CURLOPT_PROXYUSERPWD, "brd-customer-hl_11e62775-zone-datacenter_proxy1:wcnjalokvk2z"); // Pastikan proxy ini masih relevan
 curl_setopt($ch, CURLOPT_HTTPHEADER, [
-    'referer: ' . $site,
+    'referer: ' . $selected_site_referer, // Menggunakan site dari JSON
     'priority: u=1, i',
-    'origin: ' . $site,
+    'origin: ' . $selected_site_referer, // Menggunakan site dari JSON sebagai origin juga
     'user-agent: ' . $randuser,
 ]);
 curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
 curl_setopt($ch, CURLOPT_TIMEOUT, 10);
 
-$response = curl_exec($ch);
+$response_from_service = curl_exec($ch);
+$curl_error_msg = null;
+$curl_error_no = curl_errno($ch);
 
-if (curl_errno($ch)) {
-    echo json_encode(['status' => 'error', 'message' => 'Request Error: ' . curl_error($ch)]);
-    curl_close($ch);
-    exit();
+if ($curl_error_no) {
+    $curl_error_msg = curl_error($ch);
 }
-
 curl_close($ch);
 
-// --- Final Response ---
-echo json_encode([
-    'status' => 'success',
-    'api' => $apiKey,
-    'response' => json_decode($response, true)
-], JSON_PRETTY_PRINT);
+// --- 6. Return Response ---
+header('Content-Type: application/json');
+if ($curl_error_msg) {
+    error_log("cURL Error (" . $curl_error_no . ") using API key " . substr($selected_postcode_api_key, 0, 8) . "...: " . $curl_error_msg);
+    http_response_code(502); // Bad Gateway
+    echo json_encode(['status' => 'error', 'message' => 'Kesalahan saat menghubungi layanan validasi eksternal: ' . $curl_error_msg]);
+} else {
+    echo $response_from_service;
+}
+exit;
+
 ?>
